@@ -6,18 +6,23 @@ import { Input } from "./core/Input";
 import type {
 	GraphQLSchema,
 	GraphQLOutputType,
-	GraphQLScalarType,
 	GraphQLField,
 	GraphQLList,
 	GraphQLInputType,
 	GraphQLNonNull,
-	GraphQLObjectType
+	GraphQLObjectType,
+	GraphQLFieldMap,
+	GraphQLInterfaceType,
 } from "graphql";
-import { isNonNullType, isListType } from "graphql";
+import { isNonNullType, isListType, isLeafType, isUnionType, isObjectType, isInterfaceType, isScalarType } from "graphql";
 import { Button } from "./core/Button";
 import { useEffect, useState } from 'react';
 import { IconButton } from "./core/IconButton";
 import { fuzzyFilter } from 'fuzzbunny';
+
+function isObjectLikeType(type: unknown): type is (GraphQLObjectType | GraphQLInterfaceType) {
+	return isObjectType(type) || isInterfaceType(type)
+}
 
 function getRootTypes(graphqlSchema: GraphQLSchema) {
 	return ([
@@ -40,65 +45,56 @@ function getRootTypes(graphqlSchema: GraphQLSchema) {
 		)
 }
 
-function getTypeIndices(type: GraphQLAnyType): SearchIndexRecord[] {
-	const indices: SearchIndexRecord[] = [];
-
-	if (!(type as GraphQLObjectType).name) {
-		return indices;
+function visitTypeIndices(type: GraphQLAnyType, indices: Map<string, SearchIndexRecord>) {
+	if (!isObjectLikeType(type)) {
+		return Array.from(indices.values());
 	}
 
-	indices.push({
-		name: (type as GraphQLObjectType).name,
+	if (indices.has(type.name)) {
+		return Array.from(indices.values());
+	}
+
+	indices.set(type.name, {
+		name: type.name,
 		type: 'type',
 	});
 
-	if ((type as GraphQLObjectType).getFields) {
-		indices.push(
-			...getFieldsIndices((type as GraphQLObjectType).getFields())
-		)
+	if (type.getFields()) {
+		visitFieldsIndices(type.getFields(), indices);
 	}
+}
 
-	// remove duplicates from index
-	return indices.filter(
-		(x, i, array) => array.findIndex(
-			(y) => y.name === x.name && y.type === x.type
-		) === i
-	);
+function visitFieldsIndices(fieldMap: FieldsMap, indices: Map<string, SearchIndexRecord>) {
+	for (const field of Object.values(fieldMap)) {
+		if (!field.name) {
+			return;
+		}
+
+		if (indices.has(field.name)) {
+			return;
+		}
+
+		indices.set(field.name, {
+			name: field.name,
+			type: 'field',
+		});
+
+		if (field.type) {
+			visitTypeIndices(field.type, indices);
+		}
+	}
 }
 
 function getFieldsIndices(fieldMap: FieldsMap): SearchIndexRecord[] {
-	const indices: SearchIndexRecord[] = [];
+	const indices: Map<string, SearchIndexRecord> = new Map();
 
-	Object.values(fieldMap)
-		.forEach(
-			(field) => {
-				if (!field.name) {
-					return;
-				}
+	visitFieldsIndices(fieldMap, indices);
 
-				indices.push({
-					name: field.name,
-					type: 'field',
-				});
-
-				if (field.type) {
-					indices.push(
-						...getTypeIndices(field.type)
-					)
-				}
-			}
-		);
-
-	// remove duplicates from index
-	return indices.filter(
-		(x, i, array) => array.findIndex(
-			(y) => y.name === x.name && y.type === x.type
-		) === i
-	);
+	return Array.from(indices.values())
 }
 
-type Field = NonNullable<ReturnType<GraphQLSchema['getQueryType']>>;
-type FieldsMap = ReturnType<Field['getFields']>;
+type Field = GraphQLField<any, any>;
+type FieldsMap = GraphQLFieldMap<any, any>;
 type GraphQLAnyType = FieldsMap[string]['type'];
 
 type SearchIndexRecord = {
@@ -274,19 +270,55 @@ function DocsExplorer({
 
 		setSchemaPointer(type);
 		addToHistory({
-			schemaPointer: type as Field,
+			schemaPointer: type,
 			viewMode: 'explorer',
 		});
 		setViewMode('explorer');
 	};
 
 	const onFieldClick = (field: GraphQLField<any, any>) => {
-		setSchemaPointer(field as unknown as Field);
+		setSchemaPointer(field);
 		setViewMode('field');
 		addToHistory({
-			schemaPointer: field as unknown as Field,
+			schemaPointer: field,
 			viewMode: 'field',
 		});
+	};
+
+	const renderUnionRecord = (
+		type: GraphQLObjectType,
+	) => {
+		return (
+			<div
+				className="flex flex-row justify-start items-center"
+			>
+				<div
+					className="flex flex-col"
+				>
+					<div>
+						<span>
+							{ " " }
+						</span>
+						<button
+							className="cursor-pointer text-primary"
+							onClick={ () => onTypeClick(type) }
+						>
+							{ type.name }
+						</button>
+						<span>{ " " }</span>
+					</div>
+					{
+						type.description
+							? (
+								<div>
+									{ type.description }
+								</div>
+							)
+							: null
+					}
+				</div>
+			</div>
+		);
 	};
 
 	const renderSubFieldRecord = (
@@ -394,7 +426,10 @@ function DocsExplorer({
 	};
 
 	const renderScalarField = () => {
-		const scalarField = schemaPointer as GraphQLScalarType;
+		if (!isLeafType(schemaPointer)) {
+			return;
+		}
+		const scalarField = schemaPointer;
 
 		return (
 			<div>
@@ -409,20 +444,31 @@ function DocsExplorer({
 		}
 
 		if (
-			!(schemaPointer as Field).getFields
+			isLeafType(schemaPointer)
 		) {
 			// Scalar field
 			return renderScalarField();
 		}
 
-		if (!(schemaPointer as Field).getFields()) {
-			return null;
+		if (
+			isUnionType(schemaPointer)
+		) {
+			return Object.values(schemaPointer.getTypes())
+				.map(
+					(x) => renderUnionRecord(x)
+				)
 		}
 
-		return Object.values((schemaPointer as Field).getFields())
-			.map(
-				(x) => renderSubFieldRecord(x, { addable: true })
-			)
+		if (
+			isObjectLikeType(schemaPointer)
+		) {
+			return Object.values(schemaPointer.getFields())
+				.map(
+					(x) => renderSubFieldRecord(x, { addable: isObjectType(schemaPointer) })
+				)
+		}
+
+		return null;
 	};
 
 	const renderFieldDocView = () => {
@@ -438,7 +484,7 @@ function DocsExplorer({
 					{ (schemaPointer as Field).name }
 				</div>
 				{
-					(schemaPointer as Field).getFields
+					isObjectLikeType(schemaPointer)
 						? (
 							<div
 								className="my-3"
